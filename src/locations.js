@@ -1,3 +1,5 @@
+import { isUnavailableCapability } from './sources/capability.js';
+import { createOverpassFeatureSource } from './sources/overpassFeatures.js';
 import { applicationServices } from './services/application.js';
 import * as Cesium from 'cesium';
 import {
@@ -5,6 +7,11 @@ import {
   placesNearViewRecovery,
 } from './annotations/annotationResolver.js';
 import { unavailablePlaceSearch } from './search/placeSearch.js';
+import { cancelCameraArrival } from './data/cameraArrival.js';
+import { guardCameraAboveGround } from './cameraGroundGuard.js';
+
+/** Newest landmark arrival; an older post-arrival ground guard yields to it. */
+let arrivalGeneration = 0;
 
 /**
  * Points of Interest per city.
@@ -586,9 +593,12 @@ export const LOCATIONS = Object.entries(CITY_POIS).map(([id, city]) => ({
  * @param {number} options.buildingHeight - Estimated landmark center height above ground (default 30)
  * @param {number} options.groundElevation - Fallback ground elevation when terrain isn't loaded (default 0)
  * @param {number} options.duration - Flight duration in seconds (default 3.0)
+ * @param {{cachedGroundFloor?: Function, warmGroundFloor?: Function}} [options.ground] -
+ *   Optional ground-floor service; its cached elevation outranks `groundElevation`
  * @returns {{ targetPosition: Cesium.Cartesian3 }} The computed target for orbit use
  */
 export function flyToLandmark(viewer, lat, lon, options = {}) {
+  cancelCameraArrival(viewer);
   const {
     range = 500,
     pitch = -30,
@@ -600,18 +610,32 @@ export function flyToLandmark(viewer, lat, lon, options = {}) {
     onComplete = null,
     onCancel = null,
     buildingBounds = null,
+    ground = null,
   } = options;
 
   // Sample terrain height (sync — uses loaded tiles; 0 if globe/terrain not ready)
   const targetCartographic = Cesium.Cartographic.fromDegrees(lon, lat);
   const sampledHeight = viewer.scene.globe?.getHeight(targetCartographic);
 
-  // Use sampled height if available, otherwise fall back to pre-baked city ground elevation.
-  // Google 3D Tiles don't populate globe terrain, so first fly-to always gets the fallback.
+  // Use sampled height if available, otherwise the cached ground-floor
+  // elevation (same ellipsoidal datum), then the pre-baked city elevation.
+  // Google 3D Tiles don't populate globe terrain, and the preset defaults to sea
+  // level, so without the ground-floor read an uncurated destination was framed
+  // as if it stood on the ocean and the eye landed underground.
+  const realGround = ground?.cachedGroundFloor?.(lat, lon);
   const terrainHeight =
     sampledHeight != null && sampledHeight > 0
       ? sampledHeight
-      : groundElevation;
+      : Number.isFinite(realGround)
+        ? realGround
+        : groundElevation;
+  // Warm the cell so the next nearby arrival is already correct.
+  try {
+    ground?.warmGroundFloor?.([{ lat, lon }]);
+  } catch {
+    /* best-effort prefetch */
+  }
+  const generation = ++arrivalGeneration;
 
   const bounds = normalizeBuildingBounds(buildingBounds);
   const targetHeight = bounds
@@ -649,6 +673,18 @@ export function flyToLandmark(viewer, lat, lon, options = {}) {
       complete: () => {
         viewer.camera.lookAt(targetPosition, hpr);
         viewer.camera.lookAtTransform(Cesium.Matrix4.IDENTITY);
+        // Framing used a predicted ground height. Once tiles stream in, measure
+        // the rendered surface and lift the eye if it is buried or pressed
+        // against it; a newer arrival or a manual gesture ends the check.
+        try {
+          guardCameraAboveGround(
+            viewer,
+            { lat, lon },
+            { isStale: () => generation !== arrivalGeneration },
+          );
+        } catch {
+          /* best-effort */
+        }
         if (typeof onComplete === 'function') {
           try {
             onComplete();
@@ -793,13 +829,20 @@ export async function searchAndFlyTo(viewer, query, options = {}) {
   let types = result?.types || [];
   let viewport = result?.viewport || null;
 
-  // Nearby landmark recovery retains precedence over a fallback geocoder hit.
-  const recovered = await placesNearViewRecovery(
-    viewer,
-    query,
-    result && !outcome.fallbackUsed ? { lat, lon: lng } : null,
-    signal,
-  );
+  // Nearby landmark recovery retains precedence over a fallback geocoder hit,
+  // but never over an exact answer. Recovery exists to rescue a name that a
+  // geocoder read too broadly; a typed coordinate or a bundled name has no
+  // ambiguity to rescue, and letting a nearby Places hit win would send an
+  // operator who typed "43.1731, -79.0384" to whatever is closest instead.
+  const recovered = result?.exact
+    ? null
+    : await (options.recoverNearView || placesNearViewRecovery)(
+        viewer,
+        query,
+        result && !outcome.fallbackUsed ? { lat, lon: lng } : null,
+        signal,
+        placeSearch,
+      );
   signal?.throwIfAborted();
   if (recovered) {
     lat = recovered.lat;
@@ -835,6 +878,7 @@ export async function searchAndFlyTo(viewer, query, options = {}) {
         pitch: swath.pitchDeg,
         heading: swath.headingDeg,
         buildingHeight: 0,
+        ground: options.ground || null,
         duration,
         onStart: options.onStart,
         onComplete: options.onComplete,
@@ -885,26 +929,49 @@ export async function searchAndFlyTo(viewer, query, options = {}) {
 
   const shouldResolveBuilding = navigationMode === 'precise-place';
   const buildingBounds = shouldResolveBuilding
-    ? await resolveBuildingBounds(lat, lng, query)
+    ? await resolveBuildingBounds(
+        lat,
+        lng,
+        query,
+        options.features ??
+          (options.boundaries
+            ? createOverpassFeatureSource({
+                boundarySource: options.boundaries,
+              })
+            : undefined),
+        options.signal,
+      )
     : null;
   const range = requestedRange || defaultRangeForNavigationMode(navigationMode);
+  // Resolve the real ground height before framing, for the same reason as the
+  // coordinate branch: with no detailed outline, a searched place on elevated
+  // ground would otherwise be framed against sea level. Resolved before the
+  // mayFly() gate so a cancellation still wins the race.
+  const flyLat = buildingBounds?.lat ?? lat;
+  const flyLon = buildingBounds?.lon ?? lng;
+  const ground = options.ground || null;
+  await ground?.resolveGroundFloorCellsBounded?.([
+    { lat: flyLat, lon: flyLon },
+  ]);
+  const searchGroundElevation = ground?.cachedGroundFloor?.(flyLat, flyLon);
   if (!mayFly()) return CANCELLED_SEARCH;
-  const flight = flyToLandmark(
-    viewer,
-    buildingBounds?.lat ?? lat,
-    buildingBounds?.lon ?? lng,
-    {
-      range,
-      pitch: buildingPitch(buildingBounds),
-      heading: 30,
-      buildingHeight: 30,
-      buildingBounds,
-      duration,
-      onStart: options.onStart,
-      onComplete: options.onComplete,
-      onCancel: options.onCancel,
-    },
-  );
+  const flight = flyToLandmark(viewer, flyLat, flyLon, {
+    range,
+    pitch: buildingPitch(buildingBounds),
+    heading: 30,
+    buildingHeight: 30,
+    buildingBounds: isUnavailableCapability(buildingBounds)
+      ? null
+      : buildingBounds,
+    ...(Number.isFinite(searchGroundElevation)
+      ? { groundElevation: searchGroundElevation }
+      : {}),
+    ground,
+    duration,
+    onStart: options.onStart,
+    onComplete: options.onComplete,
+    onCancel: options.onCancel,
+  });
   return {
     label,
     navigationMode: requestedRange
@@ -913,6 +980,9 @@ export async function searchAndFlyTo(viewer, query, options = {}) {
         ? navigationMode.replace('-overview', '-close')
         : navigationMode,
     rangeM: Math.round(flight.range),
+    ...(isUnavailableCapability(buildingBounds)
+      ? { outlineUnavailable: true, message: 'Detailed outline unavailable' }
+      : {}),
   };
 }
 
@@ -1330,28 +1400,27 @@ function buildingPitch(bounds) {
   return -32;
 }
 
-async function resolveBuildingBounds(lat, lon, query) {
-  const overpassQuery = `
-    [out:json][timeout:10];
-    (
-      way(around:180,${lat},${lon})["building"];
-      relation(around:180,${lat},${lon})["building"];
-      way(around:180,${lat},${lon})["man_made"];
-      relation(around:180,${lat},${lon})["man_made"];
-      way(around:180,${lat},${lon})["tourism"="attraction"];
-      relation(around:180,${lat},${lon})["tourism"="attraction"];
-    );
-    out tags center geom;
-  `;
-  const controller = new AbortController();
-  const timeout = window.setTimeout(() => controller.abort(), 6000);
+async function resolveBuildingBounds(
+  lat,
+  lon,
+  query,
+  features = applicationServices.features,
+  signal,
+) {
   try {
-    const elements = await applicationServices.boundaries.query(overpassQuery, { signal: controller.signal });
-    return selectBuildingBounds(Array.isArray(elements) ? elements : [], lat, lon, query);
+    const candidates = await features.getFocusFootprints(
+      { lat, lon },
+      { signal },
+    );
+    if (isUnavailableCapability(candidates)) return candidates;
+    return selectBuildingBounds(
+      Array.isArray(candidates) ? candidates : [],
+      lat,
+      lon,
+      query,
+    );
   } catch {
     return null;
-  } finally {
-    window.clearTimeout(timeout);
   }
 }
 
@@ -1359,11 +1428,11 @@ function selectBuildingBounds(elements, targetLat, targetLon, query) {
   const queryWords = normalizedWords(query);
   const candidates = [];
   for (const element of elements) {
-    const coordinates = elementCoordinates(element);
+    const coordinates = element.coordinates;
     if (coordinates.length < 3) continue;
     const bounds = coordinateBounds(coordinates, targetLat);
     if (!bounds || bounds.width < 2 || bounds.depth < 2) continue;
-    const tags = element.tags || {};
+    const names = element.names;
     const center = element.center || averageCoordinate(coordinates);
     const distanceM = approximateDistanceM(
       targetLat,
@@ -1372,22 +1441,24 @@ function selectBuildingBounds(elements, targetLat, targetLon, query) {
       center.lon,
     );
     const nameWords = normalizedWords(
-      [tags.name, tags['name:en'], tags.official_name, tags.alt_name]
+      [names.primary, names.english, names.official, names.alternate]
         .filter(Boolean)
         .join(' '),
     );
     const nameScore = wordOverlap(queryWords, nameWords);
     const containsTarget = pointInPolygon(targetLon, targetLat, coordinates);
-    const height = buildingHeightFromTags(tags, bounds);
+    const height =
+      element.heightM ??
+      Math.max(12, Math.min(80, Math.max(bounds.width, bounds.depth) * 0.8));
     candidates.push({
       lat: center.lat,
       lon: center.lon,
       height,
       width: bounds.width,
       depth: bounds.depth,
-      osmName: tags.name || tags['name:en'] || null,
-      osmType: element.type,
-      osmId: element.id,
+      osmName: names.primary || names.english || null,
+      osmType: element.provenance?.type,
+      osmId: element.provenance?.id,
       score: nameScore * 1000 + (containsTarget ? 500 : 0) - distanceM,
     });
   }
@@ -1395,22 +1466,6 @@ function selectBuildingBounds(elements, targetLat, targetLon, query) {
   candidates.sort((a, b) => b.score - a.score);
   const { score, ...best } = candidates[0];
   return best;
-}
-
-function elementCoordinates(element) {
-  if (Array.isArray(element.geometry)) {
-    return element.geometry.filter(
-      (point) => Number.isFinite(point?.lat) && Number.isFinite(point?.lon),
-    );
-  }
-  if (!Array.isArray(element.members)) return [];
-  return element.members.flatMap((member) =>
-    Array.isArray(member.geometry)
-      ? member.geometry.filter(
-          (point) => Number.isFinite(point?.lat) && Number.isFinite(point?.lon),
-        )
-      : [],
-  );
 }
 
 function coordinateBounds(coordinates, latitude) {
@@ -1424,22 +1479,6 @@ function coordinateBounds(coordinates, latitude) {
     width: approximateDistanceM(latitude, west, latitude, east),
     depth: approximateDistanceM(south, west, north, west),
   };
-}
-
-function buildingHeightFromTags(tags, bounds) {
-  const explicitHeight = parseMeters(tags.height || tags['building:height']);
-  if (explicitHeight) return explicitHeight;
-  const levels = Number.parseFloat(tags['building:levels']);
-  const roofHeight = parseMeters(tags['roof:height']) || 0;
-  if (Number.isFinite(levels) && levels > 0) return levels * 3.3 + roofHeight;
-  return Math.max(12, Math.min(80, Math.max(bounds.width, bounds.depth) * 0.8));
-}
-
-function parseMeters(value) {
-  if (value == null) return 0;
-  const number = Number.parseFloat(String(value).replace(',', '.'));
-  if (!Number.isFinite(number) || number <= 0) return 0;
-  return /\b(ft|feet|foot)\b/i.test(String(value)) ? number * 0.3048 : number;
 }
 
 function averageCoordinate(coordinates) {

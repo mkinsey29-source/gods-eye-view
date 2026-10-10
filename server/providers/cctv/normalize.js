@@ -1,3 +1,8 @@
+import {
+  normalizeFeedType,
+  isVideoFeedType,
+} from '../../../src/sources/cctvTypes.js';
+export { normalizeFeedType, isVideoFeedType };
 import { directionToHeading } from '../../../src/data/directionText.js';
 import { haversineKm } from '../common/geo.js';
 /**
@@ -29,35 +34,6 @@ export function escapeXml(text) {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;');
-}
-
-/**
- * Canonicalize a CCTV feed type string to one of:
- * 'image', 'mjpeg', 'mp4', 'webm', 'hls', or pass-through.
- *
- * @param {string} value - Raw feed type (e.g. 'jpeg', 'mjpg', 'video', 'stream').
- * @returns {string} Normalized feed type.
- */
-export function normalizeFeedType(value) {
-  const raw = String(value || '')
-    .trim()
-    .toLowerCase();
-  if (!raw) return 'image';
-  if (raw === 'jpeg' || raw === 'jpg' || raw === 'png') return 'image';
-  if (raw === 'mjpg') return 'mjpeg';
-  if (raw === 'video') return 'mp4';
-  if (raw === 'stream') return 'hls';
-  return raw;
-}
-
-/**
- * Check whether a normalized feed type represents streaming video.
- *
- * @param {string} feedType
- * @returns {boolean}
- */
-export function isVideoFeedType(feedType) {
-  return feedType === 'mp4' || feedType === 'webm' || feedType === 'hls';
 }
 
 /**
@@ -380,6 +356,28 @@ export function isLikelyNswCoordinate(lat, lon) {
   );
 }
 
+/** Calgary's municipal extent, with slack for the ring road. */
+export function isLikelyCalgaryCoordinate(lat, lon) {
+  return (
+    isPlausibleLatLon(lat, lon) &&
+    lat >= 50.8 &&
+    lat <= 51.25 &&
+    lon >= -114.4 &&
+    lon <= -113.8
+  );
+}
+
+/** Mainland Norway, with slack for the coast and the Finnmark border. */
+export function isLikelyNorwayCoordinate(lat, lon) {
+  return (
+    isPlausibleLatLon(lat, lon) &&
+    lat >= 57.9 &&
+    lat <= 71.3 &&
+    lon >= 4.4 &&
+    lon <= 31.3
+  );
+}
+
 export function isLikelyFinlandCoordinate(lat, lon) {
   if (!Number.isFinite(lat) || !Number.isFinite(lon)) return false;
   return lat >= 59.5 && lat <= 70.5 && lon >= 19 && lon <= 32;
@@ -483,7 +481,31 @@ export function prioritizeSources(cameras, maxCount, anchors) {
     return a.idx - b.idx;
   });
 
-  return scored.slice(0, cap).map((entry) => entry.camera);
+  const kept = scored.slice(0, cap).map((entry) => entry.camera);
+  // How many cameras the pack offered before trimming, and where, for
+  // coverage reports.
+  Object.defineProperty(kept, 'available', { value: list.length });
+  Object.defineProperty(kept, 'region', { value: cameraRegion(list) });
+  return kept;
+}
+
+/** The bounding box of cameras with coordinates, or null. */
+export function cameraRegion(cameras) {
+  let region = null;
+  for (const camera of cameras || []) {
+    const lat = Number(camera?.lat);
+    const lon = Number(camera?.lon);
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
+    region = region
+      ? {
+          west: Math.min(region.west, lon),
+          south: Math.min(region.south, lat),
+          east: Math.max(region.east, lon),
+          north: Math.max(region.north, lat),
+        }
+      : { west: lon, south: lat, east: lon, north: lat };
+  }
+  return region;
 }
 
 /**

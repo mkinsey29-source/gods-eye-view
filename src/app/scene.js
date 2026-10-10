@@ -1,5 +1,9 @@
+import { createApplicationOperations } from './operations.js';
 import * as Cesium from 'cesium';
-import { createApplicationViewer } from '../app/viewer.js';
+import {
+  createApplicationViewer,
+  installTrackpadPinchZoom,
+} from '../app/viewer.js';
 import { registerDataCredits } from '../data/dataCredits.js';
 import { configureCreditKeyboardAccess } from '../creditKeyboard.js';
 import { MapStackController } from '../mapStackController.js';
@@ -13,7 +17,9 @@ import { describeError } from './errors.js';
 
 /** Construct the application globe using the caller's local configuration. */
 export async function createApplicationScene({
+  requestServices,
   googleApiKey,
+  googleTokens = null,
   cesiumToken,
   credits,
   MapController = MapStackController,
@@ -22,6 +28,10 @@ export async function createApplicationScene({
   signal,
   defer,
 }) {
+  const operations = createApplicationOperations({
+    requests: requestServices,
+    signal,
+  });
   defer(initLogoGaze());
   const previousKey = window.__GOOGLE_MAPS_API_KEY__;
   if (googleApiKey) {
@@ -46,14 +56,16 @@ export async function createApplicationScene({
     uninstallRenderGovernor(viewer);
     if (!viewer.isDestroyed()) viewer.destroy();
   });
+  defer(installTrackpadPinchZoom(viewer));
   registerDataCredits(viewer, credits);
   configureCreditKeyboardAccess(document);
   loaderStatus.textContent =
-    googleApiKey || cesiumToken
+    googleApiKey || googleTokens || cesiumToken
       ? 'Loading Google 3D Tiles...'
       : 'Loading the keyless globe...';
   const photoreal = await loadPhotorealisticTileset(Cesium, {
     googleApiKey,
+    googleTokens,
     cesiumToken,
   });
   const tileset = photoreal.tileset;
@@ -109,5 +121,5 @@ export async function createApplicationScene({
   });
 
   signal.throwIfAborted();
-  return { viewer, tileset, mapStackController };
+  return { viewer, tileset, mapStackController, operations };
 }

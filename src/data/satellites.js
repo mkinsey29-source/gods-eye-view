@@ -1,15 +1,6 @@
-import { createSourceSlot } from '../app/sourceSlot.js';
-import {
-  createSatellitesLayer,
-  createSatelliteSource,
-} from '../layers/satellites/index.js';
-import * as picking from './pickRegistry.js';
-import * as focus from './focusDeemphasis.js';
-import * as readout from './trackedReadout.js';
-import * as overlays from '../overlays/worldOverlay.js';
-import * as context from './contextStore.js';
-import * as render from '../renderGovernor.js';
-import * as layerState from './layerState.js';
+import { createApplicationSatellites } from '../app/layers/satellites.js';
+import { createSourceSlot } from '../sources/sourceSlot.js';
+import { createSatelliteSource } from '../layers/satellites/index.js';
 
 const sourceSlot = createSourceSlot(
   createSatelliteSource(),
@@ -17,9 +8,8 @@ const sourceSlot = createSourceSlot(
   'Satellite source',
 );
 export const configureSatelliteSource = sourceSlot.configure;
-const layer = createSatellitesLayer({
+const layer = createApplicationSatellites({
   source: sourceSlot.source,
-  services: { picking, focus, readout, overlays, context, render, layerState },
 });
 export const satelliteVisualsVisible = layer.satelliteVisualsVisible;
 export const satelliteCatalogModeChanged = layer.satelliteCatalogModeChanged;
@@ -51,6 +41,7 @@ export const _clearSatelliteLabelLifecycleForTest =
 export const applySatellitePointFocusDeemphasis =
   layer.applySatellitePointFocusDeemphasis;
 export const getNextIssPass = layer.getNextIssPass;
+export const getNextSatellitePass = layer.getNextSatellitePass;
 export const scoreSatelliteNameMatch = layer.scoreSatelliteNameMatch;
 export const findSatelliteOrbitTrackInTle = layer.findSatelliteOrbitTrackInTle;
 export const getSatelliteOrbitTrack = layer.getSatelliteOrbitTrack;
@@ -59,3 +50,5 @@ export {
   ISS_OVERLAY_SOURCE_OPTIONS,
 } from '../layers/satellites/index.js';
 export default layer;
+
+export { mapAnalystRecord } from '../layers/satellites/records.js';
